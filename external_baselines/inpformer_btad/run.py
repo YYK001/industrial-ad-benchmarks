@@ -1,0 +1,344 @@
+"""Independent check / resource smoke / train / predict / evaluate commands."""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import gc
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import time
+
+import numpy as np
+
+from .data import CATEGORIES, SPATIAL, find_root, image_records, geometry, load_gt, records
+from .model import external, symbols, build, predict_batches
+
+TITLE = 'INP-Former官方单类full-shot配置的BTAD外部复评'
+PROTOCOL = 'inpformer_btad_single_class_fullshot_seed1_crop_v1'
+CONFIG = dict(external.OFFICIAL_CONFIG, seed=1, precision='FP32', shuffle=True, drop_last=True,
+              optimizer='StableAdamW', lr=1e-3, betas=[.9, .999], weight_decay=1e-4,
+              amsgrad=True, eps=1e-10, scheduler='WarmCosineScheduler', final_lr=1e-4,
+              warmup_iters=100, loss='global_cosine_hm_adaptive(y=3) + 0.2*g_loss',
+              clip_grad_max_norm=.1, checkpoint='last_epoch_only', spatial=SPATIAL)
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)+'\n', encoding='utf-8')
+
+
+def write_csv(path, rows):
+    if not rows:
+        return
+    with path.open('w', encoding='utf-8', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader(); writer.writerows(rows)
+
+
+def fresh(path):
+    path = Path(path).resolve()
+    path.mkdir(parents=True, exist_ok=False)
+    return path
+
+
+def selected(args):
+    return CATEGORIES if args.category == 'all' else (args.category,)
+
+
+def source_state(args):
+    root = Path(args.official_root).resolve()
+    head = external.read_git_head_without_git(root)
+    if head != external.EXPECTED_OFFICIAL_COMMIT:
+        raise ValueError('unreviewed official source version: '+head)
+    return dict(title=TITLE, protocol=PROTOCOL, config=CONFIG,
+                official_commit=head, official_root=str(root),
+                backbone_sha256=external.EXPECTED_BACKBONE_SHA256,
+                external_reuse='external_baselines/inpformer_external/run.py',
+                python=platform.python_version(), packages=external.package_versions(),
+                arguments=vars(args), cuda_launch_blocking=os.environ.get('CUDA_LAUNCH_BLOCKING', 'unset'),
+                runtime=dict(num_workers=args.workers, pin_memory=True,
+                             persistent_workers=args.workers>0, prefetch_factor=2 if args.workers else None,
+                             tf32=False, autocast=False))
+
+
+def save_config(out, args):
+    """Small source snapshot, no data/weights/features or hash closure."""
+    write_json(out/'config.json', source_state(args))
+    project = Path(__file__).resolve().parents[2]
+    official = Path(args.official_root).resolve()
+    sources = [(p, Path('official')/p.relative_to(official)) for p in official.rglob('*.py')
+               if '.git' not in p.parts]
+    for folder in (Path(__file__).parent, project/'external_baselines/inpformer_external'):
+        sources.extend((p, Path(folder.name)/p.name) for p in folder.glob('*.py'))
+    for relative in ('DINOv3/MADEqual/btad_validation/dataset.py',
+                     'DINOv3/MADEqual/mvtec_broad6_compose2/metrics.py',
+                     'DINOv3/MADEqual/hard_sample_discrimination/scoring.py',
+                     'DINOv3/nsrm/m0_scoring.py'):
+        sources.append((project/relative, Path(relative)))
+    for source, relative in sources:
+        target = out/'source_snapshot'/relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+
+
+class Meter:
+    def __init__(self, out, device):
+        self.out, self.device, self.rows = out, device, []
+
+    @contextlib.contextmanager
+    def measure(self, stage, category):
+        import torch
+        cuda = self.device.type == 'cuda'
+        if cuda:
+            torch.cuda.synchronize(self.device)
+            torch.cuda.reset_peak_memory_stats(self.device)
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            if cuda:
+                torch.cuda.synchronize(self.device)
+            self.rows.append(dict(stage=stage, category=category, seconds=time.perf_counter()-start,
+                peak_allocated_bytes=torch.cuda.max_memory_allocated(self.device) if cuda else 0,
+                peak_reserved_bytes=torch.cuda.max_memory_reserved(self.device) if cuda else 0))
+            write_csv(self.out/'resources.csv', self.rows)
+
+
+def cuda(args):
+    import torch
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
+    device = torch.device(args.device)
+    if device.type != 'cuda' or not torch.cuda.is_available():
+        raise RuntimeError('resource smoke and formal stages require real CUDA; use check/tests on CPU')
+    torch.cuda.set_device(device)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    return device
+
+
+def check(args):
+    root, train, test, _, _ = records(args.dataset_root, selected(args), inspect_masks=True)
+    out = fresh(args.output_dir)
+    save_config(out, args)
+    rows, listing = [], []
+    for c in selected(args):
+        masks = [load_gt(r)[1] for r in test[c] if r.label == 1]
+        rows.append(dict(category=c, train_normal=len(train[c]), test_count=len(test[c]),
+                         test_normal=sum(r.label == 0 for r in test[c]),
+                         test_anomaly=sum(r.label == 1 for r in test[c]),
+                         **{k:sum(m[k] for m in masks) for k in ('raw_empty','cropped_empty','evaluation_empty')}))
+        for split, items in (('train', train[c]), ('test', test[c])):
+            pure = image_records(root, c, split)
+            if [r.path for r in items] != [r.path for r in pure]:
+                raise ValueError('BTAD test universe/order mismatch')
+            for r in items:
+                listing.append(dict(category=c, split=split, relative_path=Path(r.path).relative_to(root).as_posix(),
+                    label=r.label, mask=Path(r.mask_path).relative_to(root).as_posix() if r.mask_path else '',
+                    role='fullshot_normal_training' if split=='train' else 'evaluation', geometry=geometry(r.path)))
+    write_csv(out/'counts.csv', rows)
+    write_json(out/'input_manifest.json', listing)
+    write_json(out/'complete.json', dict(stage='check', counts=rows, status='complete', protocol=PROTOCOL))
+    print(json.dumps(rows, indent=2))
+
+
+def save_checkpoint(path, model, category, count, smoke=False):
+    import torch
+    torch.save(dict(protocol=PROTOCOL, category=category, config=CONFIG,
+                    epoch=1 if smoke else 200, smoke=smoke, train_count=count,
+                    model=model.state_dict()), path)
+
+
+def load_checkpoint(path, model, category):
+    import torch
+    state = torch.load(path, map_location='cpu', weights_only=False)
+    if (state.get('protocol') != PROTOCOL or state.get('category') != category or
+        state.get('config') != CONFIG or state.get('smoke') or state.get('epoch') != 200):
+        raise ValueError('requires this protocol category final epoch 200 checkpoint; smoke/RobustAD forbidden')
+    model.load_state_dict(state['model'], strict=True)
+    return state['train_count']
+
+
+def train(args):
+    import torch
+    device = cuda(args); root = find_root(args.dataset_root); out = fresh(args.output_dir)
+    save_config(out, args); meter = Meter(out, device)
+    value = symbols(args.official_root, args.backbone)
+    transform, _ = value['get_data_transforms'](448, 392)
+    for c in selected(args):
+        items = image_records(root, c, 'train')
+        value['setup_seed'](1)
+        with meter.measure('initialization', c):
+            model, trainable = build(value, args.official_root, device)
+        dest = out/c; dest.mkdir()
+        write_json(dest/'training_inputs.json', [Path(r.path).relative_to(root).as_posix() for r in items])
+        with meter.measure('training', c):
+            history = external.train_model(model, trainable, items, transform, value, device, 200, 16, args.workers)
+        write_csv(dest/'epoch_losses.csv', history)
+        with meter.measure('checkpoint_storage', c):
+            save_checkpoint(dest/'last.pt', model, c, len(items))
+        write_json(dest/'complete.json', dict(protocol=PROTOCOL, category=c, epoch=200, train_count=len(items),
+                   steps_per_epoch=len(items)//16, scheduler_total_iters=200*(len(items)//16)))
+        del model, trainable; gc.collect(); torch.cuda.empty_cache()
+    write_json(out/'complete.json', dict(protocol=PROTOCOL, stage='train', categories=selected(args)))
+
+
+def predict(args):
+    import torch
+    device = cuda(args); root = find_root(args.dataset_root); out = fresh(args.output_dir)
+    save_config(out, args); meter = Meter(out, device)
+    value = symbols(args.official_root, args.backbone)
+    transform, _ = value['get_data_transforms'](448, 392)
+    for c in selected(args):
+        items = image_records(root, c, 'test')
+        value['setup_seed'](1)
+        with meter.measure('initialization_and_checkpoint_load', c):
+            model, trainable = build(value, args.official_root, device)
+            count = load_checkpoint(Path(args.checkpoint_root)/c/'last.pt', model, c)
+        dest = out/c; dest.mkdir(); rows = []
+        with meter.measure('inference_including_prediction_storage', c):
+            for offset, maps, scores in predict_batches(model, items, transform, value, device, args.workers):
+                for j, (pixel, score) in enumerate(zip(maps, scores)):
+                    i = offset+j; relative = Path(items[i].path).relative_to(root).as_posix()
+                    np.save(dest/f'{i:04d}.npy', pixel, allow_pickle=False)
+                    rows.append(dict(index=i, relative_path=relative, image_score=float(score),
+                                     prediction=f'{i:04d}.npy', geometry=geometry(items[i].path)))
+        write_json(dest/'predictions.json', rows)
+        write_csv(dest/'image_scores.csv', [{k:v for k,v in r.items() if k!='geometry'} for r in rows])
+        write_json(dest/'complete.json', dict(protocol=PROTOCOL, stage='predict', category=c,
+                   train_count=count, test_count=len(items), checkpoint_epoch=200, spatial=SPATIAL))
+        del model, trainable; gc.collect(); torch.cuda.empty_cache()
+    write_json(out/'complete.json', dict(protocol=PROTOCOL, stage='predict', categories=selected(args)))
+
+
+def evaluate(args):
+    from sklearn.metrics import roc_auc_score, average_precision_score
+    from DINOv3.MADEqual.mvtec_broad6_compose2.metrics import evaluate_fast, METRIC_NAMES
+    from DINOv3.MADEqual.hard_sample_discrimination.scoring import fixed_fpr_diagnostics
+    device = cuda(args); root = find_root(args.dataset_root); out = fresh(args.output_dir)
+    meter = Meter(out, device); metrics, operating, audits, counts = [], [], [], []
+    save_config(out, args)
+    for c in selected(args):
+        dest = Path(args.prediction_root)/c
+        state = json.loads((dest/'complete.json').read_text(encoding='utf-8'))
+        if state.get('protocol') != PROTOCOL or state.get('checkpoint_epoch') != 200 or state.get('spatial') != SPATIAL:
+            raise ValueError('incompatible/incomplete prediction set')
+        with meter.measure('evaluation_inputs_and_gt_read', c):
+            _, _, test, _, _ = records(root, (c,), inspect_masks=False)
+            rows = json.loads((dest/'predictions.json').read_text(encoding='utf-8'))
+            items = test[c]
+            if [r['relative_path'] for r in rows] != [Path(r.path).relative_to(root).as_posix() for r in items]:
+                raise ValueError('prediction/test universe mismatch')
+            maps, masks, scores = [], [], []
+            for row, record in zip(rows, items):
+                if row['geometry'] != geometry(record.path):
+                    raise ValueError('prediction geometry mismatch')
+                pixel = np.load(dest/row['prediction'], allow_pickle=False)
+                if pixel.shape != (256,256) or pixel.dtype != np.float32 or not np.isfinite(pixel).all():
+                    raise ValueError('invalid prediction map')
+                mask, audit = load_gt(record)
+                masks.append(mask); maps.append(pixel); scores.append(row['image_score'])
+                if record.label == 1:
+                    audits.append(dict(category=c, relative_path=row['relative_path'], **audit))
+            labels = [r.label for r in items]
+        with meter.measure('metric_evaluation', c):
+            result = evaluate_fast(labels, masks, maps, device=device, allow_cpu_fallback=False)
+            # evaluate_fast's default image maximum is replaced by the persisted official top-1% score.
+            result.update(image_AUROC=float(roc_auc_score(labels, scores)),
+                          image_AUPR=float(average_precision_score(labels, scores)))
+            metrics.append(dict(category=c, **result))
+            operating.extend(dict(category=c, **r) for r in fixed_fpr_diagnostics(maps, masks))
+        counts.append(dict(category=c, train_normal=state['train_count'], test_count=len(items),
+            **{k:sum(r[k] for r in audits if r['category']==c) for k in ('raw_empty','cropped_empty','evaluation_empty')}))
+        del maps, masks; gc.collect()
+    macro = [dict(scope='three_category_equal_macro' if len(metrics)==3 else 'selected_category_equal_macro',
+                  category_count=len(metrics), **{k:float(np.mean([r[k] for r in metrics])) for k in METRIC_NAMES})]
+    fixed_macro = []
+    for cap in (.01, .05):
+        subset = [r for r in operating if r['fpr_cap']==cap]
+        row = dict(fpr_cap=cap, category_count=len(subset))
+        for key in ('defect_pixel_recall', 'region_mean_coverage', 'small_region_mean_coverage'):
+            vals = [r[key] for r in subset if r[key] != 'N/A']
+            row[key] = float(np.mean(vals)) if vals else 'N/A'
+            row[key+'_category_count'] = len(vals)
+        fixed_macro.append(row)
+    for name, rows in dict(category_metrics=metrics, macro_metrics=macro, fixed_fpr=operating,
+                           fixed_fpr_macro=fixed_macro, mask_audit=audits, counts=counts).items():
+        write_csv(out/(name+'.csv'), rows)
+    (out/'report.md').write_text('# '+TITLE+'\n\n官方中心裁剪视野，256×256 评价。不能与旧 BTAD 完整视野指标直接计算差值。\n'
+        '各类独立正常 full-shot，200 轮最后 checkpoint；非原论文 BTAD 结果复现。\n'
+        'AUPR 字段均为 average precision (AP)。AUPRO 复用快速 CUDA，200 阈值，FPR≤0.3。\n'
+        '固定 FPR 1%/5% 为测试集事后诊断，不是部署误报率。四连通，小区域≤本次 256×256 面积的 0.1%。\n'
+        '空 mask 异常保留图像标签；小区域 N/A 不参与该项 macro。\n\n'
+        '五指标与类别等权 macro 见 category_metrics.csv、macro_metrics.csv；固定 FPR 见 fixed_fpr*.csv。\n', encoding='utf-8')
+    write_json(out/'complete.json', dict(protocol=PROTOCOL, stage='evaluate', categories=selected(args), macro=macro))
+
+
+def smoke(args):
+    """One normal-only batch, real model; retain the full-run LR schedule."""
+    import torch
+    device = cuda(args); root = find_root(args.dataset_root); out = fresh(args.output_dir)
+    save_config(out, args); meter = Meter(out, device)
+    value = symbols(args.official_root, args.backbone)
+    transform, _ = value['get_data_transforms'](448, 392)
+    for c in selected(args):
+        all_items = image_records(root, c, 'train'); items = all_items[:16]
+        if len(items) != 16:
+            raise ValueError('smoke requires 16 distinct normal training images')
+        value['setup_seed'](1)
+        with meter.measure('initialization', c):
+            model, trainable = build(value, args.official_root, device)
+        smoke_symbols = dict(value)
+        def full_schedule(optimizer, **kwargs):
+            kwargs['total_iters'] = 200*(len(all_items)//16)
+            return value['WarmCosineScheduler'](optimizer, **kwargs)
+        smoke_symbols['WarmCosineScheduler'] = full_schedule
+        with meter.measure('one_training_step', c):
+            history = external.train_model(model, trainable, items, transform, smoke_symbols, device, 1, 16, args.workers)
+        with meter.measure('normal_only_prediction', c):
+            before = list(predict_batches(model, items[:2], transform, value, device, args.workers))
+        dest = out/c; dest.mkdir(); write_csv(dest/'smoke_loss.csv', history)
+        save_checkpoint(dest/'smoke.pt', model, c, len(all_items), smoke=True)
+        del model, trainable; gc.collect(); torch.cuda.empty_cache()
+        with meter.measure('reload_and_prediction', c):
+            model, trainable = build(value, args.official_root, device)
+            state = torch.load(dest/'smoke.pt', map_location='cpu', weights_only=False)
+            model.load_state_dict(state['model'], strict=True); del state
+            after = list(predict_batches(model, items[:2], transform, value, device, args.workers))
+        np.testing.assert_array_equal(before[0][1], after[0][1])
+        np.testing.assert_array_equal(before[0][2], after[0][2])
+        write_json(dest/'complete.json', dict(stage='smoke', reload_prediction_identical=True,
+                   training_steps=1, schedule_total_iters=200*(len(all_items)//16), formal_result=False))
+        del model, trainable; gc.collect(); torch.cuda.empty_cache()
+    write_json(out/'complete.json', dict(stage='smoke', formal_result=False, categories=selected(args)))
+
+
+def parser():
+    p = argparse.ArgumentParser(description=TITLE)
+    sub = p.add_subparsers(dest='command', required=True)
+    for name in ('check','smoke','train','predict','evaluate'):
+        q = sub.add_parser(name)
+        q.add_argument('--dataset-root', required=True)
+        q.add_argument('--output-dir', required=True, help='must not already exist')
+        q.add_argument('--category', choices=('all',*CATEGORIES), default='all')
+        q.add_argument('--official-root', default='external_baselines/INP-Former')
+        q.add_argument('--device', default='cuda:0')
+        q.add_argument('--workers', type=int, default=4)
+        if name in ('smoke','train','predict'):
+            q.add_argument('--backbone', required=True)
+        if name == 'predict': q.add_argument('--checkpoint-root', required=True)
+        if name == 'evaluate': q.add_argument('--prediction-root', required=True)
+    return p
+
+
+def main():
+    args = parser().parse_args()
+    if args.workers < 0: raise ValueError('workers must be nonnegative')
+    globals()[args.command](args)
+
+
+if __name__ == '__main__':
+    main()
