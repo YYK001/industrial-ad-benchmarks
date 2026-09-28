@@ -61,7 +61,8 @@ def source_state(args):
                 external_reuse='external_baselines/inpformer_external/run.py',
                 python=platform.python_version(), packages=external.package_versions(),
                 arguments=vars(args), cuda_launch_blocking=os.environ.get('CUDA_LAUNCH_BLOCKING', 'unset'),
-                progress_checkpoints=dict(every_epochs=20, rolling_resume=True, evaluation_epoch=200),
+                progress_checkpoints=dict(every_epochs=20, rolling_resume=True, keep_history=False,
+                                          remove_resume_after_final=True, evaluation_epoch=200),
                 runtime=dict(num_workers=args.workers, pin_memory=True,
                              persistent_workers=args.workers>0, prefetch_factor=2 if args.workers else None,
                              tf32=False, autocast=False))
@@ -202,8 +203,6 @@ def train(args):
             payload = dict(protocol=PROTOCOL, category=c, config=CONFIG, epoch=epoch,
                            model_without_encoder=weights, train_count=len(items), smoke=False)
             temporary = dest/'checkpoint.tmp'
-            torch.save(payload, temporary)
-            temporary.replace(dest/f'epoch_{epoch:03d}.pt')
             payload.update(kind='epoch_resume', optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict(),
                            history=list(history), training_inputs=identifiers, workers=args.workers,
                            python_rng=random.getstate(), numpy_rng=np.random.get_state(),
@@ -216,7 +215,11 @@ def train(args):
                                            resume_state=resume, epoch_callback=checkpoint_epoch)
         write_csv(dest/'epoch_losses.csv', history)
         with meter.measure('checkpoint_storage', c):
-            save_checkpoint(dest/'last.pt', model, c, len(items))
+            temporary = dest/'last.tmp'
+            save_checkpoint(temporary, model, c, len(items))
+            temporary.replace(dest/'last.pt')
+            # Keep the recovery point until the final checkpoint is fully written.
+            (dest/'resume_latest.pt').unlink(missing_ok=True)
         write_json(dest/'complete.json', dict(protocol=PROTOCOL, category=c, epoch=200, train_count=len(items),
                    steps_per_epoch=len(items)//16, scheduler_total_iters=200*(len(items)//16)))
         del model, trainable; gc.collect(); torch.cuda.empty_cache()

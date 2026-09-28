@@ -175,9 +175,10 @@ python -m external_baselines.inpformer_btad.run evaluate \
 `metrics-smoke` 的 CPU 分支仅用于合成数据对照；正式 `evaluate` 仍禁止 CPU fallback。
 若手动使用第二张 T4，各类进程必须使用不同的输出目录；随后将已完成的各类目录
 置于统一 checkpoint/prediction 根目录再评价。入口本身不调度并行训练。
-每类每 20 轮（10%）保存 `epoch_020.pt` 至 `epoch_200.pt`，不重复保存冻结编码器。
-同时原子更新 `resume_latest.pt`，包含非编码器模型状态、优化器、调度器、每轮损失、
-Python/NumPy/PyTorch/当前 CUDA 卡的随机状态；训练结束另存完整 `last.pt` 供正式评价。
+每类每 20 轮（10%）原子覆盖 `resume_latest.pt`，只保留最新恢复点，不累计 `epoch_*.pt`。
+恢复文件不重复保存冻结编码器，包含非编码器模型状态、优化器、调度器、每轮损失、
+Python/NumPy/PyTorch/当前 CUDA 卡的随机状态；训练结束原子保存完整 `last.pt` 供正式评价，
+确认最终文件写入成功后删除本次输出目录中的恢复文件，每个完成类别只保留最终模型。
 每轮损失也即时写入 CSV。所有进度文件均不用于测试集挑选。
 
 Kaggle 双卡正式训练（显式运行后才开始，GPU0=03，GPU1=01→02，每进程两个 workers）：
@@ -203,8 +204,9 @@ python -m external_baselines.inpformer_btad.run train \
 恢复要求正常训练清单、类别、配置和 workers 相同，保持相同软件环境；当前输入变换无随机增强。
 CPU 测试覆盖 workers=0 和 persistent workers=1 下，中断恢复与连续训练逐参数、逐轮损失精确一致。
 真实 CUDA 中断恢复尚未验证。会话结束后临时磁盘可能丢失，保存 checkpoint 不等于跨会话持久化；
-需要你及时取回或保存运行输出。恢复到新目录不会复制旧目录已有的历史轮次快照。
-按当前模型估算三类全部快照、滚动恢复文件和最后模型约需 13–15 GB，另加权重和 smoke 文件；
+需要你及时取回或保存运行输出。恢复到新目录不会删除旧目录的恢复文件。
+滚动保存需要临时新旧文件共存的空间，但不再随轮次累计；另需容纳权重和已有 smoke 文件。
+更新代码不会改变已经运行的 Python 进程，也不会自动清理旧版本生成的历史快照。
 20 GB 临时磁盘应避免同时保留多套正式输出，实际占用以运行环境为准。
 
 ## 本轮本地验证

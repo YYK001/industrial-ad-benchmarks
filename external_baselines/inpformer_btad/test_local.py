@@ -303,6 +303,7 @@ def test_checkpoint_every_twenty_epochs(btad, official, tmp_path, monkeypatch):
     def small_build(*args):
         net=Tiny(); return net,net
     monkeypatch.setattr(run,'build',small_build)
+    saved_epochs=[]
     def simulated_epochs(net,trainable,*args,epoch_callback=None,**kwargs):
         optimizer=official['StableAdamW'](trainable.parameters())
         scheduler=official['WarmCosineScheduler'](optimizer,base_value=.001,final_value=.0001,total_iters=200,warmup_iters=100)
@@ -310,6 +311,14 @@ def test_checkpoint_every_twenty_epochs(btad, official, tmp_path, monkeypatch):
         for epoch in range(1,201):
             history.append(dict(epoch=epoch,loss=1.0))
             epoch_callback(epoch,history,optimizer,scheduler)
+            dest=out/'01'
+            assert not list(dest.glob('epoch_*.pt'))
+            if epoch % 20 == 0:
+                state=torch.load(dest/'resume_latest.pt',weights_only=False)
+                assert state['epoch']==epoch and len(state['history'])==epoch
+                assert 'optimizer' in state and 'scheduler' in state
+                assert len(list(dest.glob('*.pt')))==1
+                saved_epochs.append(epoch)
         return history
     monkeypatch.setattr(model.external,'train_model',simulated_epochs)
     out=tmp_path/'checkpoint_test'
@@ -317,8 +326,7 @@ def test_checkpoint_every_twenty_epochs(btad, official, tmp_path, monkeypatch):
         '--workers','0','--official-root',str(OFFICIAL),'--output-dir',str(out)])
     run.train(args)
     dest=out/'01'
-    assert sorted(p.name for p in dest.glob('epoch_*.pt'))==[f'epoch_{i:03d}.pt' for i in range(20,201,20)]
-    state=torch.load(dest/'resume_latest.pt',weights_only=False)
-    assert state['epoch']==200 and len(state['history'])==200 and 'optimizer' in state and 'scheduler' in state
+    assert saved_epochs==list(range(20,201,20))
+    assert [p.name for p in dest.glob('*.pt')]==['last.pt']
     assert not (dest/'checkpoint.tmp').exists()
     assert run.load_checkpoint(dest/'last.pt',Tiny(),'01')==16
