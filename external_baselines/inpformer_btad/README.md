@@ -19,7 +19,8 @@ GitHub 同步版请使用根目录 README 中的 `git clone --recurse-submodules
 - 01/02/03 各自初始化、独立训练，seed=1。使用各类全部 `train/ok`，没有校准划分。
   `shuffle=True, drop_last=True` 意味着每轮不足 16 的尾批被丢弃，但不会预先排除训练图片。
 - `dinov2reg_vit_base_14`，448×448 resize、392×392 center crop、INP_num=6；
-  batch=16，FP32，200 轮，只有最后一轮 checkpoint；无早停、无测试集择优。
+  batch=16，FP32，200 轮，只有最后一轮用于评价；无早停、无测试集择优。
+  每 20 轮另存进度 checkpoint，用于保存进度，不用于测试集择优。
 - 仅从显式本地 DINOv2 预训练权重初始化编码器。INP、bottleneck、extractor、decoder
   使用官方初始化；训练入口没有检测模型 checkpoint 参数，不支持 RobustAD 检测模型续训。
 - 官方 `StableAdamW(lr=1e-3, betas=(0.9,0.999), weight_decay=1e-4, amsgrad=True, eps=1e-10)`。
@@ -174,7 +175,37 @@ python -m external_baselines.inpformer_btad.run evaluate \
 `metrics-smoke` 的 CPU 分支仅用于合成数据对照；正式 `evaluate` 仍禁止 CPU fallback。
 若手动使用第二张 T4，各类进程必须使用不同的输出目录；随后将已完成的各类目录
 置于统一 checkpoint/prediction 根目录再评价。入口本身不调度并行训练。
-200 轮必须能在当前运行窗口内完成；当前入口未提供中断续训，也不保存优化器恢复状态。
+每类每 20 轮（10%）保存 `epoch_020.pt` 至 `epoch_200.pt`，不重复保存冻结编码器。
+同时原子更新 `resume_latest.pt`，包含非编码器模型状态、优化器、调度器、每轮损失、
+Python/NumPy/PyTorch/当前 CUDA 卡的随机状态；训练结束另存完整 `last.pt` 供正式评价。
+每轮损失也即时写入 CSV。所有进度文件均不用于测试集挑选。
+
+Kaggle 双卡正式训练（显式运行后才开始，GPU0=03，GPU1=01→02，每进程两个 workers）：
+
+```bash
+python tools/kaggle_train_btad.py --dataset-root "$DATA" --backbone "$WEIGHT" \
+  --output-root /kaggle/working/inpformer_btad_formal_v1
+```
+
+各类训练目录为 `train_01/01`、`train_02/02`、`train_03/03`，日志在输出根目录。
+三类全部完成后，脚本用硬链接汇集最终 checkpoint 到 `checkpoints/<类别>/last.pt`，
+可直接将这个 `checkpoints` 目录传给独立 predict 命令，不复制大文件，不自动启动评价。
+
+中断后，使用保留下来的 `resume_latest.pt` 续训同一类别，仍为总共 200 轮；输出必须是新目录：
+
+```bash
+python -m external_baselines.inpformer_btad.run train \
+  --dataset-root "$DATA" --backbone "$WEIGHT" --category 03 --device cuda:0 --workers 2 \
+  --resume /path/to/preserved/train_03/03/resume_latest.pt \
+  --output-dir /kaggle/working/inpformer_resume_03_v2
+```
+
+恢复要求正常训练清单、类别、配置和 workers 相同，保持相同软件环境；当前输入变换无随机增强。
+CPU 测试覆盖 workers=0 和 persistent workers=1 下，中断恢复与连续训练逐参数、逐轮损失精确一致。
+真实 CUDA 中断恢复尚未验证。会话结束后临时磁盘可能丢失，保存 checkpoint 不等于跨会话持久化；
+需要你及时取回或保存运行输出。恢复到新目录不会复制旧目录已有的历史轮次快照。
+按当前模型估算三类全部快照、滚动恢复文件和最后模型约需 13–15 GB，另加权重和 smoke 文件；
+20 GB 临时磁盘应避免同时保留多套正式输出，实际占用以运行环境为准。
 
 ## 本轮本地验证
 

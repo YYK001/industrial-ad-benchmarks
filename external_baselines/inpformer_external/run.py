@@ -406,6 +406,7 @@ def data_loader_options(num_workers: int) -> Dict[str, Any]:
 def train_model(
     model: Any, trainable: Any, records: Sequence[Record], transform: Any, symbols: Dict[str, Any],
     device: Any, epochs: int, batch_size: int, num_workers: int,
+    resume_state: Optional[Dict[str, Any]] = None, epoch_callback: Any = None,
 ) -> List[Dict[str, float]]:
     import torch
     from torch.utils.data import DataLoader
@@ -426,7 +427,23 @@ def train_model(
         total_iters=epochs * len(loader), warmup_iters=100,
     )
     history: List[Dict[str, float]] = []
-    for epoch in range(epochs):
+    start_epoch = 0
+    if resume_state is not None:
+        import random
+        optimizer.load_state_dict(resume_state['optimizer'])
+        scheduler.load_state_dict(resume_state['scheduler'])
+        history = list(resume_state['history'])
+        start_epoch = int(resume_state['epoch'])
+        # Persistent workers consume a base seed only on their first iterator.
+        # Prime the new worker pool before restoring the saved epoch-boundary RNG.
+        if num_workers > 0:
+            iter(loader)
+        random.setstate(resume_state['python_rng'])
+        np.random.set_state(resume_state['numpy_rng'])
+        torch.set_rng_state(resume_state['torch_rng'])
+        if resume_state['cuda_rng'] is not None:
+            torch.cuda.set_rng_state(resume_state['cuda_rng'], device)
+    for epoch in range(start_epoch, epochs):
         model.train()
         losses = []
         for images, _ in tqdm(loader, ncols=80):
@@ -443,6 +460,8 @@ def train_model(
         mean_loss = float(np.mean(losses))
         print("epoch [{}/{}], loss:{:.4f}".format(epoch + 1, epochs, mean_loss), flush=True)
         history.append({"epoch": epoch + 1, "loss": mean_loss})
+        if epoch_callback is not None:
+            epoch_callback(epoch + 1, history, optimizer, scheduler)
     return history
 
 

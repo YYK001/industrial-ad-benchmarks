@@ -267,3 +267,58 @@ def test_metrics_smoke_synthetic_only(tmp_path, monkeypatch):
     state=json.loads((out/'complete.json').read_text())
     assert calls==[False,True] and state['cuda_cpu_agree']
     assert not state['formal_result'] and state['fixed_fpr'][0]['small_region_count']==1
+
+
+@pytest.mark.parametrize('workers', [0, 1])
+def test_resume_matches_uninterrupted_training(btad, official, workers):
+    import random
+    tf,_=official['get_data_transforms'](448,392)
+    items=data.image_records(btad,'01','train')
+    torch.manual_seed(3); full=Tiny(); interrupted=copy.deepcopy(full)
+    torch.manual_seed(7)
+    expected=model.external.train_model(full,full,items,tf,official,'cpu',4,16,workers)
+    saved={}
+    class StopAtBoundary(Exception): pass
+    def checkpoint(epoch,history,optimizer,scheduler):
+        if epoch==2:
+            saved.update(copy.deepcopy(dict(epoch=epoch,history=history,optimizer=optimizer.state_dict(),
+                scheduler=scheduler.state_dict(),python_rng=random.getstate(),numpy_rng=np.random.get_state(),
+                torch_rng=torch.get_rng_state(),cuda_rng=None,model=interrupted.state_dict())))
+            raise StopAtBoundary()
+    torch.manual_seed(7)
+    with pytest.raises(StopAtBoundary):
+        model.external.train_model(interrupted,interrupted,items,tf,official,'cpu',4,16,workers,
+                                   epoch_callback=checkpoint)
+    resumed=Tiny(); resumed.load_state_dict(saved['model'])
+    actual=model.external.train_model(resumed,resumed,items,tf,official,'cpu',4,16,workers,resume_state=saved)
+    assert expected==actual
+    for x,y in zip(full.parameters(),resumed.parameters()):
+        torch.testing.assert_close(x,y,rtol=0,atol=0)
+
+
+def test_checkpoint_every_twenty_epochs(btad, official, tmp_path, monkeypatch):
+    monkeypatch.setattr(run,'cuda',lambda args:torch.device('cpu'))
+    monkeypatch.setattr(torch.cuda,'get_rng_state',lambda device:None)
+    monkeypatch.setattr(run,'symbols',lambda *args:dict(official,setup_seed=torch.manual_seed))
+    def small_build(*args):
+        net=Tiny(); return net,net
+    monkeypatch.setattr(run,'build',small_build)
+    def simulated_epochs(net,trainable,*args,epoch_callback=None,**kwargs):
+        optimizer=official['StableAdamW'](trainable.parameters())
+        scheduler=official['WarmCosineScheduler'](optimizer,base_value=.001,final_value=.0001,total_iters=200,warmup_iters=100)
+        history=[]
+        for epoch in range(1,201):
+            history.append(dict(epoch=epoch,loss=1.0))
+            epoch_callback(epoch,history,optimizer,scheduler)
+        return history
+    monkeypatch.setattr(model.external,'train_model',simulated_epochs)
+    out=tmp_path/'checkpoint_test'
+    args=run.parser().parse_args(['train','--dataset-root',str(btad),'--backbone','unused','--category','01',
+        '--workers','0','--official-root',str(OFFICIAL),'--output-dir',str(out)])
+    run.train(args)
+    dest=out/'01'
+    assert sorted(p.name for p in dest.glob('epoch_*.pt'))==[f'epoch_{i:03d}.pt' for i in range(20,201,20)]
+    state=torch.load(dest/'resume_latest.pt',weights_only=False)
+    assert state['epoch']==200 and len(state['history'])==200 and 'optimizer' in state and 'scheduler' in state
+    assert not (dest/'checkpoint.tmp').exists()
+    assert run.load_checkpoint(dest/'last.pt',Tiny(),'01')==16

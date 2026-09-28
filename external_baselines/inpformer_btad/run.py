@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import random
 import time
 
 import numpy as np
@@ -60,6 +61,7 @@ def source_state(args):
                 external_reuse='external_baselines/inpformer_external/run.py',
                 python=platform.python_version(), packages=external.package_versions(),
                 arguments=vars(args), cuda_launch_blocking=os.environ.get('CUDA_LAUNCH_BLOCKING', 'unset'),
+                progress_checkpoints=dict(every_epochs=20, rolling_resume=True, evaluation_epoch=200),
                 runtime=dict(num_workers=args.workers, pin_memory=True,
                              persistent_workers=args.workers>0, prefetch_factor=2 if args.workers else None,
                              tf32=False, autocast=False))
@@ -174,9 +176,44 @@ def train(args):
         with meter.measure('initialization', c):
             model, trainable = build(value, args.official_root, device)
         dest = out/c; dest.mkdir()
-        write_json(dest/'training_inputs.json', [Path(r.path).relative_to(root).as_posix() for r in items])
+        identifiers = [Path(r.path).relative_to(root).as_posix() for r in items]
+        write_json(dest/'training_inputs.json', identifiers)
+        resume = None
+        if args.resume:
+            if args.category == 'all': raise ValueError('--resume requires one explicit category')
+            resume = torch.load(args.resume, map_location='cpu', weights_only=False)
+            if (resume.get('protocol') != PROTOCOL or resume.get('category') != c or
+                resume.get('config') != CONFIG or resume.get('training_inputs') != identifiers or
+                resume.get('workers') != args.workers or resume.get('kind') != 'epoch_resume' or
+                not 0 < resume.get('epoch', 0) <= 200):
+                raise ValueError('incompatible resume checkpoint/category/training inputs/workers')
+            weights = model.state_dict()
+            expected = {k for k in weights if not k.startswith('encoder.')}
+            if set(resume['model_without_encoder']) != expected:
+                raise ValueError('resume trainable model keys mismatch')
+            weights.update(resume['model_without_encoder'])
+            model.load_state_dict(weights, strict=True)
+            del weights
+        def checkpoint_epoch(epoch, history, optimizer, scheduler):
+            write_csv(dest/'epoch_losses.csv', history)
+            if epoch % 20: return
+            # Frozen encoder is reloaded from the verified pretrained file on resume.
+            weights = {k:v for k,v in model.state_dict().items() if not k.startswith('encoder.')}
+            payload = dict(protocol=PROTOCOL, category=c, config=CONFIG, epoch=epoch,
+                           model_without_encoder=weights, train_count=len(items), smoke=False)
+            temporary = dest/'checkpoint.tmp'
+            torch.save(payload, temporary)
+            temporary.replace(dest/f'epoch_{epoch:03d}.pt')
+            payload.update(kind='epoch_resume', optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict(),
+                           history=list(history), training_inputs=identifiers, workers=args.workers,
+                           python_rng=random.getstate(), numpy_rng=np.random.get_state(),
+                           torch_rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state(device))
+            torch.save(payload, temporary)
+            temporary.replace(dest/'resume_latest.pt')
+            print(f'checkpoint saved: {c} epoch {epoch}/200', flush=True)
         with meter.measure('training', c):
-            history = external.train_model(model, trainable, items, transform, value, device, 200, 16, args.workers)
+            history = external.train_model(model, trainable, items, transform, value, device, 200, 16, args.workers,
+                                           resume_state=resume, epoch_callback=checkpoint_epoch)
         write_csv(dest/'epoch_losses.csv', history)
         with meter.measure('checkpoint_storage', c):
             save_checkpoint(dest/'last.pt', model, c, len(items))
@@ -377,6 +414,7 @@ def parser():
         if name in ('smoke','train','predict'):
             q.add_argument('--backbone', required=True)
         if name == 'predict': q.add_argument('--checkpoint-root', required=True)
+        if name == 'train': q.add_argument('--resume', help='resume_latest.pt from an interrupted category; use a NEW output directory')
         if name == 'evaluate': q.add_argument('--prediction-root', required=True)
     return p
 
