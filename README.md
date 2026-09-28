@@ -36,7 +36,7 @@ python -m external_baselines.inpformer_btad.run check \
   --output-dir /kaggle/working/inpformer_check
 ```
 
-完整依赖、固定协议和独立 `check / smoke / train / predict / evaluate` 命令见
+完整依赖、固定协议和独立 `check / smoke / metrics-smoke / train / predict / evaluate` 命令见
 [INP-Former BTAD README](external_baselines/inpformer_btad/README.md)。
 其中旧示例的项目目录 `experiment` 应替换成你实际克隆的 `industrial-ad-benchmarks`。
 

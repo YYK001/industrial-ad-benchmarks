@@ -278,26 +278,42 @@ def evaluate(args):
 
 
 def smoke(args):
-    """One normal-only batch, real model; retain the full-run LR schedule."""
+    """Two normal-only batches, including a nonzero-LR update; full-run schedule."""
     import torch
     device = cuda(args); root = find_root(args.dataset_root); out = fresh(args.output_dir)
     save_config(out, args); meter = Meter(out, device)
     value = symbols(args.official_root, args.backbone)
     transform, _ = value['get_data_transforms'](448, 392)
     for c in selected(args):
-        all_items = image_records(root, c, 'train'); items = all_items[:16]
-        if len(items) != 16:
-            raise ValueError('smoke requires 16 distinct normal training images')
+        all_items = image_records(root, c, 'train'); items = all_items[:32]
+        if len(items) != 32:
+            raise ValueError('smoke requires 32 distinct normal training images')
         value['setup_seed'](1)
         with meter.measure('initialization', c):
             model, trainable = build(value, args.official_root, device)
+        initial = [p.detach().cpu().clone() for p in trainable.parameters()]
+        learning_rates = []
         smoke_symbols = dict(value)
+        class ObservedAdamW(value['StableAdamW']):
+            def step(self, *step_args, **step_kwargs):
+                learning_rates.append(float(self.param_groups[0]['lr']))
+                return super().step(*step_args, **step_kwargs)
+        smoke_symbols['StableAdamW'] = ObservedAdamW
         def full_schedule(optimizer, **kwargs):
             kwargs['total_iters'] = 200*(len(all_items)//16)
             return value['WarmCosineScheduler'](optimizer, **kwargs)
         smoke_symbols['WarmCosineScheduler'] = full_schedule
-        with meter.measure('one_training_step', c):
+        with meter.measure('two_training_steps', c):
             history = external.train_model(model, trainable, items, transform, smoke_symbols, device, 1, 16, args.workers)
+        changed = 0
+        for previous, parameter in zip(initial, trainable.parameters()):
+            current = parameter.detach().cpu()
+            if not torch.isfinite(current).all():
+                raise FloatingPointError('nonfinite trainable parameters after smoke')
+            changed += int(not torch.equal(previous, current))
+        del initial
+        if len(learning_rates) != 2 or learning_rates[0] != 0 or learning_rates[1] <= 0 or not changed:
+            raise RuntimeError('smoke did not verify a nonzero-LR parameter update')
         with meter.measure('normal_only_prediction', c):
             before = list(predict_batches(model, items[:2], transform, value, device, args.workers))
         dest = out/c; dest.mkdir(); write_csv(dest/'smoke_loss.csv', history)
@@ -311,17 +327,48 @@ def smoke(args):
         np.testing.assert_array_equal(before[0][1], after[0][1])
         np.testing.assert_array_equal(before[0][2], after[0][2])
         write_json(dest/'complete.json', dict(stage='smoke', reload_prediction_identical=True,
-                   training_steps=1, schedule_total_iters=200*(len(all_items)//16), formal_result=False))
+                   training_steps=2, learning_rates=learning_rates, changed_parameter_tensors=changed,
+                   nonzero_lr_update_verified=True,
+                   schedule_total_iters=200*(len(all_items)//16), formal_result=False))
         del model, trainable; gc.collect(); torch.cuda.empty_cache()
     write_json(out/'complete.json', dict(stage='smoke', formal_result=False, categories=selected(args)))
+
+
+def metrics_smoke(args):
+    """Synthetic arrays only; exercise the existing CUDA metric path against its CPU path."""
+    import torch
+    from DINOv3.MADEqual.mvtec_broad6_compose2.metrics import evaluate_fast, METRIC_NAMES
+    from DINOv3.MADEqual.hard_sample_discrimination.scoring import fixed_fpr_diagnostics
+    device = cuda(args); out = fresh(args.output_dir)
+    save_config(out, args); meter = Meter(out, device)
+    rng = np.random.default_rng(1)
+    masks = [np.zeros((256, 256), bool) for _ in range(4)]
+    masks[1][60:92, 90:118] = True
+    masks[1][150:154, 180:184] = True  # Small region in this evaluation coordinate system.
+    masks[2][30:70, 40:70] = True
+    labels = [0, 1, 1, 1]  # Includes an anomalous image with an empty mask.
+    maps = [rng.random(m.shape).astype(np.float32) + .35*m.astype(np.float32) for m in masks]
+    with meter.measure('synthetic_cuda_metrics', ''):
+        gpu = evaluate_fast(labels, masks, maps, device=device, allow_cpu_fallback=False)
+    with meter.measure('synthetic_cpu_reference', ''):
+        cpu = evaluate_fast(labels, masks, maps, device=torch.device('cpu'), allow_cpu_fallback=True)
+    for key in METRIC_NAMES:
+        np.testing.assert_allclose(gpu[key], cpu[key], rtol=1e-5, atol=1e-6, err_msg=key)
+    with meter.measure('synthetic_fixed_fpr', ''):
+        operating = fixed_fpr_diagnostics(maps, masks)
+    if any(r['actual_fpr'] > r['fpr_cap'] or r['small_region_count'] != 1 for r in operating):
+        raise RuntimeError('synthetic fixed-FPR contract failed')
+    write_json(out/'complete.json', dict(stage='metrics-smoke', formal_result=False,
+               inputs='synthetic_only_no_BTAD_images_or_labels', cuda_cpu_agree=True,
+               cuda_metrics=gpu, cpu_reference=cpu, fixed_fpr=operating))
 
 
 def parser():
     p = argparse.ArgumentParser(description=TITLE)
     sub = p.add_subparsers(dest='command', required=True)
-    for name in ('check','smoke','train','predict','evaluate'):
+    for name in ('check','smoke','metrics-smoke','train','predict','evaluate'):
         q = sub.add_parser(name)
-        q.add_argument('--dataset-root', required=True)
+        if name != 'metrics-smoke': q.add_argument('--dataset-root', required=True)
         q.add_argument('--output-dir', required=True, help='must not already exist')
         q.add_argument('--category', choices=('all',*CATEGORIES), default='all')
         q.add_argument('--official-root', default='external_baselines/INP-Former')
@@ -337,7 +384,7 @@ def parser():
 def main():
     args = parser().parse_args()
     if args.workers < 0: raise ValueError('workers must be nonnegative')
-    globals()[args.command](args)
+    globals()[args.command.replace('-', '_')](args)
 
 
 if __name__ == '__main__':

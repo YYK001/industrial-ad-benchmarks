@@ -141,11 +141,15 @@ OUT=/kaggle/working/inpformer_btad_v1
 python -m external_baselines.inpformer_btad.run check \
   --dataset-root "$DATA" --output-dir "$OUT/check"
 
-# 资源 smoke：真实官方模型，一个正常 batch 的训练与正常图推理、保存重载比较。
+# 资源 smoke：真实官方模型，两个正常 batch 的训练与正常图推理、保存重载比较。
 # 调度总步数仍按该类完整训练 loader×200 计算；无测试效果、无参数选择。
 python -m external_baselines.inpformer_btad.run smoke \
   --dataset-root "$DATA" --backbone "$WEIGHT" --category 01 \
   --device cuda:0 --workers 4 --output-dir "$OUT/smoke_01"
+
+# 独立指标 smoke：只用合成数组，CUDA 与既有 CPU 指标分支对照，不读取 BTAD 测试集。
+python -m external_baselines.inpformer_btad.run metrics-smoke \
+  --device cuda:0 --output-dir "$OUT/metrics_smoke"
 
 # 正式训练：三类独立、200轮、最后 checkpoint。仅供后续显式执行，本轮未运行。
 python -m external_baselines.inpformer_btad.run train \
@@ -164,6 +168,10 @@ python -m external_baselines.inpformer_btad.run evaluate \
 ```
 
 可用 `--category 01/02/03` 按类运行，默认 all。每个命令可指定 `--official-root`。
+两步 smoke 使用前 32 张正常训练图片、batch=16，保留完整训练的调度总步数。
+记录两步实际学习率，要求首步为 0、第二步大于 0、参数有限且确实发生更新；
+随后严格检查 checkpoint 重载预测一致性。它不会自动触发正式训练。
+`metrics-smoke` 的 CPU 分支仅用于合成数据对照；正式 `evaluate` 仍禁止 CPU fallback。
 若手动使用第二张 T4，各类进程必须使用不同的输出目录；随后将已完成的各类目录
 置于统一 checkpoint/prediction 根目录再评价。入口本身不调度并行训练。
 200 轮必须能在当前运行窗口内完成；当前入口未提供中断续训，也不保存优化器恢复状态。

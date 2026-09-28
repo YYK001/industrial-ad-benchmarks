@@ -227,3 +227,43 @@ def test_evaluate_artifacts_macro_and_official_image_scores(btad,tmp_path,monkey
     assert (out/'fixed_fpr_macro.csv').is_file() and (out/'mask_audit.csv').is_file()
     assert (out/'source_snapshot/official/INP_Former_Single_Class.py').is_file()
     with pytest.raises(FileExistsError): run.fresh(out)
+
+
+def test_two_step_smoke_nonzero_update_and_reload(btad, official, tmp_path, monkeypatch):
+    import json
+    for i in range(16,32):
+        Image.fromarray(np.full((64,96),40+i,np.uint8)).save(btad/'01/train/ok'/f'{i:03d}.bmp')
+    monkeypatch.setattr(run,'cuda',lambda args:torch.device('cpu'))
+    monkeypatch.setattr(run,'symbols',lambda *args:dict(official,setup_seed=torch.manual_seed))
+    def small_build(*args):
+        net=Tiny()
+        return net,net
+    monkeypatch.setattr(run,'build',small_build)
+    out=tmp_path/'smoke'
+    args=run.parser().parse_args(['smoke','--dataset-root',str(btad),'--backbone','unused',
+        '--category','01','--workers','0','--official-root',str(OFFICIAL),'--output-dir',str(out)])
+    run.smoke(args)
+    state=json.loads((out/'01/complete.json').read_text())
+    assert state['training_steps']==2 and state['learning_rates'][0]==0
+    assert state['learning_rates'][1]>0 and state['changed_parameter_tensors']>0
+    assert state['nonzero_lr_update_verified'] and state['reload_prediction_identical']
+    assert state['schedule_total_iters']==400 and not state['formal_result']
+
+
+def test_metrics_smoke_synthetic_only(tmp_path, monkeypatch):
+    import json
+    from DINOv3.MADEqual.mvtec_broad6_compose2 import metrics
+    real=metrics.evaluate_fast
+    calls=[]
+    def cpu_test(*args,**kwargs):
+        calls.append(kwargs['allow_cpu_fallback'])
+        kwargs['allow_cpu_fallback']=True
+        return real(*args,**kwargs)
+    monkeypatch.setattr(metrics,'evaluate_fast',cpu_test)
+    monkeypatch.setattr(run,'cuda',lambda args:torch.device('cpu'))
+    out=tmp_path/'metrics_smoke'
+    args=run.parser().parse_args(['metrics-smoke','--official-root',str(OFFICIAL),'--output-dir',str(out)])
+    run.metrics_smoke(args)
+    state=json.loads((out/'complete.json').read_text())
+    assert calls==[False,True] and state['cuda_cpu_agree']
+    assert not state['formal_result'] and state['fixed_fpr'][0]['small_region_count']==1
