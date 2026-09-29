@@ -14,6 +14,7 @@ def main():
     destination = Path(__file__).resolve().parents[1]
     pending = list((source/'external_baselines/inpformer_btad').glob('*.py'))
     pending += list((source/'external_baselines/inpformer_external').glob('*.py'))
+    pending += list((source/'external_baselines/inpformer_benchmarks').glob('*.py'))
     pending += [source/'DINOv2/nvs/conditional_nvs/metrics.py']
     seen = set()
 
@@ -51,7 +52,8 @@ def main():
         target = destination/path.relative_to(source)
         target.parent.mkdir(parents=True,exist_ok=True)
         shutil.copyfile(path,target)
-    for name in ('inpformer_btad','inpformer_external'):
+    for name in ('inpformer_btad','inpformer_external','inpformer_benchmarks'):
+        if not (source/'external_baselines'/name/'README.md').is_file(): continue
         shutil.copyfile(source/'external_baselines'/name/'README.md',destination/'external_baselines'/name/'README.md')
     print('Exported',len(seen),'Python source files')
     for p in sorted(seen): print(p.relative_to(source).as_posix())

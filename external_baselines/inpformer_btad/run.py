@@ -11,6 +11,7 @@ from pathlib import Path
 import platform
 import shutil
 import random
+import subprocess
 import time
 
 import numpy as np
@@ -20,6 +21,9 @@ from .model import external, symbols, build, predict_batches
 
 TITLE = 'INP-Former官方单类full-shot配置的BTAD外部复评'
 PROTOCOL = 'inpformer_btad_single_class_fullshot_seed1_crop_v1'
+DATASET_NAME = 'BTAD'
+COMPACT_FINAL = False
+FULL_MACRO_SCOPE = 'three_category_equal_macro'
 CONFIG = dict(external.OFFICIAL_CONFIG, seed=1, precision='FP32', shuffle=True, drop_last=True,
               optimizer='StableAdamW', lr=1e-3, betas=[.9, .999], weight_decay=1e-4,
               amsgrad=True, eps=1e-10, scheduler='WarmCosineScheduler', final_lr=1e-4,
@@ -55,7 +59,17 @@ def source_state(args):
     head = external.read_git_head_without_git(root)
     if head != external.EXPECTED_OFFICIAL_COMMIT:
         raise ValueError('unreviewed official source version: '+head)
+    project=Path(__file__).resolve().parents[2]
+    revision=None; dirty=None
+    try:
+        revision=external.read_git_head_without_git(project)
+        status=subprocess.run(['git','status','--porcelain'],cwd=project,capture_output=True,text=True,check=True)
+        dirty=bool(status.stdout.strip())
+    except (OSError,RuntimeError,subprocess.SubprocessError):
+        pass  # The actual source snapshot remains available without Git metadata.
     return dict(title=TITLE, protocol=PROTOCOL, config=CONFIG,
+                adapter_revision=revision, adapter_worktree_dirty=dirty, dataset=DATASET_NAME,
+                final_checkpoint_format='model_without_encoder' if COMPACT_FINAL else 'full_model',
                 official_commit=head, official_root=str(root),
                 backbone_sha256=external.EXPECTED_BACKBONE_SHA256,
                 external_reuse='external_baselines/inpformer_external/run.py',
@@ -75,13 +89,16 @@ def save_config(out, args):
     official = Path(args.official_root).resolve()
     sources = [(p, Path('official')/p.relative_to(official)) for p in official.rglob('*.py')
                if '.git' not in p.parts]
-    for folder in (Path(__file__).parent, project/'external_baselines/inpformer_external'):
+    for folder in (Path(__file__).parent, project/'external_baselines/inpformer_external',
+                   project/'external_baselines/inpformer_benchmarks'):
         sources.extend((p, Path(folder.name)/p.name) for p in folder.glob('*.py'))
     for relative in ('DINOv3/MADEqual/btad_validation/dataset.py',
+                     'DINOv3/MADEqual/visa_task_decoupled/dataset.py',
+                     'DINOv3/relation_reliability/datasets.py',
                      'DINOv3/MADEqual/mvtec_broad6_compose2/metrics.py',
                      'DINOv3/MADEqual/hard_sample_discrimination/scoring.py',
                      'DINOv3/nsrm/m0_scoring.py'):
-        sources.append((project/relative, Path(relative)))
+        if (project/relative).is_file(): sources.append((project/relative, Path(relative)))
     for source, relative in sources:
         target = out/'source_snapshot'/relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -150,9 +167,23 @@ def check(args):
 
 def save_checkpoint(path, model, category, count, smoke=False):
     import torch
+    weights = ({'model_without_encoder': {k:v for k,v in model.state_dict().items() if not k.startswith('encoder.')}}
+               if COMPACT_FINAL else {'model':model.state_dict()})
     torch.save(dict(protocol=PROTOCOL, category=category, config=CONFIG,
                     epoch=1 if smoke else 200, smoke=smoke, train_count=count,
-                    model=model.state_dict()), path)
+                    **weights), path)
+
+
+def restore_model(model, state):
+    if 'model' in state:
+        model.load_state_dict(state['model'], strict=True)
+        return
+    current=model.state_dict()
+    expected={k for k in current if not k.startswith('encoder.')}
+    if set(state['model_without_encoder'])!=expected:
+        raise ValueError('compact checkpoint keys mismatch')
+    current.update(state['model_without_encoder'])
+    model.load_state_dict(current,strict=True)
 
 
 def load_checkpoint(path, model, category):
@@ -161,7 +192,7 @@ def load_checkpoint(path, model, category):
     if (state.get('protocol') != PROTOCOL or state.get('category') != category or
         state.get('config') != CONFIG or state.get('smoke') or state.get('epoch') != 200):
         raise ValueError('requires this protocol category final epoch 200 checkpoint; smoke/RobustAD forbidden')
-    model.load_state_dict(state['model'], strict=True)
+    restore_model(model, state)
     return state['train_count']
 
 
@@ -209,6 +240,7 @@ def train(args):
                            torch_rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state(device))
             torch.save(payload, temporary)
             temporary.replace(dest/'resume_latest.pt')
+            write_json(dest/'checkpoint_progress.json', dict(epoch=epoch, filename='resume_latest.pt'))
             print(f'checkpoint saved: {c} epoch {epoch}/200', flush=True)
         with meter.measure('training', c):
             history = external.train_model(model, trainable, items, transform, value, device, 200, 16, args.workers,
@@ -294,7 +326,7 @@ def evaluate(args):
         counts.append(dict(category=c, train_normal=state['train_count'], test_count=len(items),
             **{k:sum(r[k] for r in audits if r['category']==c) for k in ('raw_empty','cropped_empty','evaluation_empty')}))
         del maps, masks; gc.collect()
-    macro = [dict(scope='three_category_equal_macro' if len(metrics)==3 else 'selected_category_equal_macro',
+    macro = [dict(scope=FULL_MACRO_SCOPE if tuple(selected(args))==tuple(CATEGORIES) else 'selected_category_equal_macro',
                   category_count=len(metrics), **{k:float(np.mean([r[k] for r in metrics])) for k in METRIC_NAMES})]
     fixed_macro = []
     for cap in (.01, .05):
@@ -308,8 +340,8 @@ def evaluate(args):
     for name, rows in dict(category_metrics=metrics, macro_metrics=macro, fixed_fpr=operating,
                            fixed_fpr_macro=fixed_macro, mask_audit=audits, counts=counts).items():
         write_csv(out/(name+'.csv'), rows)
-    (out/'report.md').write_text('# '+TITLE+'\n\n官方中心裁剪视野，256×256 评价。不能与旧 BTAD 完整视野指标直接计算差值。\n'
-        '各类独立正常 full-shot，200 轮最后 checkpoint；非原论文 BTAD 结果复现。\n'
+    (out/'report.md').write_text('# '+TITLE+'\n\n官方中心裁剪视野，256×256 评价。不能与完整视野指标直接计算差值。\n'
+        '各类独立正常 full-shot，200 轮最后 checkpoint；本报告使用当前环境和既有CUDA指标，不主张原论文指标逐位复现。\n'
         'AUPR 字段均为 average precision (AP)。AUPRO 复用快速 CUDA，200 阈值，FPR≤0.3。\n'
         '固定 FPR 1%/5% 为测试集事后诊断，不是部署误报率。四连通，小区域≤本次 256×256 面积的 0.1%。\n'
         '空 mask 异常保留图像标签；小区域 N/A 不参与该项 macro。\n\n'
@@ -362,7 +394,7 @@ def smoke(args):
         with meter.measure('reload_and_prediction', c):
             model, trainable = build(value, args.official_root, device)
             state = torch.load(dest/'smoke.pt', map_location='cpu', weights_only=False)
-            model.load_state_dict(state['model'], strict=True); del state
+            restore_model(model, state); del state
             after = list(predict_batches(model, items[:2], transform, value, device, args.workers))
         np.testing.assert_array_equal(before[0][1], after[0][1])
         np.testing.assert_array_equal(before[0][2], after[0][2])

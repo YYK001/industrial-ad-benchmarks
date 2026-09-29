@@ -3,7 +3,8 @@
 工业异常检测外部基线、数据适配和评价代码，面向 Kaggle 环境同步。
 
 当前交付：**INP-Former官方单类full-shot配置的BTAD外部复评**。
-MVTec AD / VisA 的统一外部适配尚未接入；不要将本仓库描述为已完成全部数据集复现。
+MVTec AD / VisA 已有独立数据入口、续跑流程和结果打包；正式运行结果尚待Kaggle执行。
+说明见 [MVTec AD / VisA README](external_baselines/inpformer_benchmarks/README.md)。
 
 ## 获取代码
 
