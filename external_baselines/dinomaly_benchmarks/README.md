@@ -62,6 +62,8 @@ AP=average precision；AUPRO=既有快速 CUDA、200 个阈值、FPR≤.3、既�
 这里选独立 Python3.10、torch2.1.2+cu118、torchvision0.16.2，与官方历史 torch1.12+cu113 环境不同，
 属于待 smoke 验证的兼容环境；官方 requirements.txt 完整保留。配对参考 [PyTorch 官方历史版本说明](https://pytorch.org/get-started/previous-versions/)。
 不修改既有 DeSTSeg 或其他方法环境。不额外安装 xformers，采用官方 attention 的非 xformers 路径。
+兼容依赖清单补充 `colorama==0.4.6`：官方 optimizer 包导入时会连带导入 ACProp，
+其顶层依赖 colorama，即使实际训练只使用 StableAdamW 也需安装；官方源码和训练算法不变。
 
 ```bash
 REPO=/kaggle/working/industrial-ad-benchmarks  # 改成代码所在根目录
