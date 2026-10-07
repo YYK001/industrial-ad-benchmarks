@@ -6,6 +6,17 @@
 MVTec AD / VisA 已有独立数据入口、续跑流程和结果打包；正式运行结果尚待Kaggle执行。
 说明见 [MVTec AD / VisA README](external_baselines/inpformer_benchmarks/README.md)。
 
+本分支新增 **Dinomaly 官方单类版本（MVTec AD / VisA）**，说明与分阶段命令见
+[Dinomaly README](external_baselines/dinomaly_benchmarks/README.md)。
+官方源码作为独立固定版本 submodule；已有 INP-Former 源码与入口保持不变。
+
+获取 Dinomaly 独立分支：
+
+```bash
+git clone --branch dinomaly-official-single-class --recurse-submodules https://github.com/YYK001/industrial-ad-benchmarks.git
+cd industrial-ad-benchmarks
+```
+
 ## 获取代码
 
 ```bash
@@ -52,6 +63,10 @@ python -m pytest external_baselines/inpformer_btad/test_local.py -q
 
 ## 仓库范围
 
+- `external_baselines/dinomaly_benchmarks`：Dinomaly 单类训练、恢复、缓存复评与双 T4 入口。
+- `external_baselines/dinomaly_official`：锁定 `1f252be03a918789b19848f0ca37166e7c28dada` 的官方 submodule。
+- 新增的 PatchCore 评价工具、DeSTSeg 资源/进程工具和 DINOv3 路径下的公共依赖只供复用函数，
+  不代表启用这些方法的检测模型；详细复用关系见 Dinomaly README。
 - `external_baselines/inpformer_btad`：独立 BTAD 入口与测试。
 - `external_baselines/inpformer_external`：复用已有模型构建、训练和工具函数。
 - `external_baselines/INP-Former`：固定版本官方 submodule。

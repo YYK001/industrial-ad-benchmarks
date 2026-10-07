@@ -1,3 +1,6 @@
 [submodule "external_baselines/INP-Former"]
 	path = external_baselines/INP-Former
 	url = https://github.com/luow23/INP-Former.git
+[submodule "external_baselines/dinomaly_official"]
+	path = external_baselines/dinomaly_official
+	url = https://github.com/guojiajeremy/Dinomaly.git
